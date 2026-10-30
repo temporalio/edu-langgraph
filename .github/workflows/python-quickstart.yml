@@ -1,0 +1,48 @@
+name: python-quickstart
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'python/quickstart/**'
+      - '.github/workflows/python-quickstart.yml'
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: python/quickstart
+    env:
+      TEMPORAL_TASK_QUEUE: ci-langgraph
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Install Temporal CLI
+        run: curl -sSf https://temporal.download/cli.sh | sh -s -- --dir "$HOME/.temporalio" && echo "$HOME/.temporalio/bin" >> "$GITHUB_PATH"
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Start dev server
+        run: |
+          temporal server start-dev --headless > /tmp/dev-server.log 2>&1 &
+          for _ in $(seq 1 30); do temporal operator cluster health && break; sleep 1; done
+      - name: Start Worker
+        run: |
+          uv run worker.py > /tmp/worker.log 2>&1 &
+          for _ in $(seq 1 30); do grep -q "polling task queue" /tmp/worker.log && break; sleep 1; done
+      - name: Run client
+        run: uv run client.py | tee /tmp/client.log
+      - name: Assert result
+        run: |
+          grep -q "Result: Processed: Hello, Temporal + LangGraph!" /tmp/client.log
+          completed=$(temporal workflow list -o json --query "TaskQueue=\"$TEMPORAL_TASK_QUEUE\" AND WorkflowType=\"HelloWorldWorkflow\" AND ExecutionStatus=\"Completed\"" | jq length)
+          test "$completed" -eq 1
+      - name: Worker log
+        if: always()
+        run: cat /tmp/worker.log
